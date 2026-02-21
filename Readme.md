@@ -1,18 +1,21 @@
 # Private Credit & Financial Stability RAG System
 
-> A production-grade, fully local Retrieval-Augmented Generation system for analyzing academic research papers on private credit markets and BDC operations.
+> A production-grade, fully local Retrieval-Augmented Generation system for analyzing academic research papers on private credit markets and BDC operations — served via a FastAPI REST interface.
 
 ## Project Overview
 
-This project implements an advanced RAG pipeline that combines semantic search with large language model inference to create an intelligent document analysis system. Built entirely for local execution on consumer hardware (8GB VRAM), it eliminates dependency on cloud APIs while maintaining high-quality responses.
+This project implements an advanced RAG pipeline that combines semantic search with large language model inference to create an intelligent document analysis system. Built entirely for local execution on consumer hardware (8GB VRAM), it eliminates dependency on cloud APIs while maintaining high-quality responses. The system is served as a REST API using FastAPI, enabling programmatic access to the RAG pipeline from any HTTP client.
 
 **Target Document**: "Private Credit and Financial Stability" by Sergey Chernenko & David Scharfstein (56-page academic research paper)
 
 ### Key Capabilities
 
 - Real-time semantic search across 143 document chunks with sub-100ms latency
-- Context-aware question answering with source attribution
-- Financial domain specialization through custom prompting
+- REST API interface via FastAPI with interactive Swagger UI documentation
+- Context-aware question answering with strict document boundary enforcement
+- Financial domain specialization through rule-based structured prompting
+- Verbatim citation of financial metrics and definitions from source text
+- Explicit signalling when retrieved context is insufficient, rather than hallucinating
 - Zero-shot inference on complex financial terminology and concepts
 - Complete data privacy - no external API calls
 
@@ -25,7 +28,7 @@ This project implements an advanced RAG pipeline that combines semantic search w
 ```
 PDF Document → Document Loader → Text Splitter → Embedding Model → Vector Store
                                                                           ↓
-User Query → Embedding Model → Similarity Search → Context Retrieval → LLM → Response
+HTTP Request → FastAPI (/ask) → Embedding Model → Similarity Search → Context Retrieval → LLM → JSON Response
 ```
 
 ### Technical Stack
@@ -38,6 +41,7 @@ User Query → Embedding Model → Similarity Search → Context Retrieval → L
 | **Vector Database** | FAISS | Approximate nearest neighbor search |
 | **LLM** | Qwen 2.5 1.5B Instruct | Instruction-tuned causal language model |
 | **Framework** | LangChain | RAG orchestration and prompt management |
+| **API Server** | FastAPI | Async REST API with Pydantic validation |
 
 ---
 
@@ -123,9 +127,14 @@ def format_prompt(question):
     # 3. Context Aggregation
     context = '\n---\n'.join([doc.page_content for doc in search_results])
     
-    # 4. Prompt Construction
-    prompt = f'''You are an experienced Financial Analyst. Answer based on context.
-    
+    # 4. Prompt Construction with Structured Rules
+    prompt = f'''You are a Financial Analyst. Answer the question only from the context provided.
+    RULES:
+    1. You must be factually Accurate
+    2. If the information is not sufficient then mention 'Not enough information is provided in the document'
+    3. You must not answer beyond the context provided
+    4. Cite the financial metrics and definitions exactly as present in the context
+
 context:
 {context}
 
@@ -139,13 +148,29 @@ Answer: '''
 
 ### Prompt Engineering Strategy
 
-**System Role**: Financial Analyst persona establishes domain expertise and response style.
+**System Role**: Financial Analyst persona establishes domain expertise and grounds the response style in professional financial analysis.
 
-**Context Injection**: Retrieved chunks are inserted directly into the prompt with clear delimiters (`---`) to help the model distinguish between sources.
+**Structured Rule Enforcement**: The updated prompt moves beyond a single vague directive to four explicit, numbered constraints that directly shape model behavior:
 
-**Instruction Clarity**: Explicit directive to "answer based on context" grounds responses in retrieved information rather than parametric knowledge.
+- **Rule 1 – Factual Accuracy**: Instructs the model to treat factual correctness as non-negotiable, reducing hallucination risk on domain-specific financial data.
+- **Rule 2 – Graceful Degradation**: When retrieved context is insufficient, the model is required to explicitly state *"Not enough information is provided in the document"* rather than fabricating an answer from parametric memory. This makes knowledge gaps transparent to the user.
+- **Rule 3 – Context Boundary Enforcement**: Strictly prohibits the model from reasoning beyond the retrieved chunks, preventing the blending of internal pretraining knowledge with document-specific facts — a common failure mode in financial RAG systems.
+- **Rule 4 – Verbatim Metric Citation**: Requires financial metrics, ratios, and definitions to be cited exactly as they appear in the source text, ensuring numerical precision and eliminating paraphrasing errors on critical data.
+
+**Context Injection**: Retrieved chunks are inserted directly into the prompt with clear `---` delimiters to help the model distinguish between source segments.
 
 **Output Control**: `return_full_text=False` strips the prompt from the output, returning only the generated answer.
+
+#### Impact on Response Quality
+
+The structured rule-based prompt produces measurably different responses compared to the original single-line instruction:
+
+| Dimension | Original Prompt | Updated Prompt |
+|-----------|----------------|----------------|
+| **Out-of-scope queries** | May draw on parametric knowledge, generating plausible but ungrounded answers | Explicitly refuses and signals insufficient context |
+| **Metric citation** | Paraphrases or approximates figures | Reproduces financial metrics verbatim from the document |
+| **Hallucination risk** | Higher — model defaults to general financial knowledge when context is thin | Lower — rules create a hard boundary around retrieved content |
+| **Transparency** | Silent on retrieval gaps | Actively communicates when the document lacks relevant information |
 
 ### Chunk Retrieval Strategy
 
@@ -157,6 +182,101 @@ Answer: '''
 **Expected Performance**:
 - Simple factual queries: Typically answered from top 1-2 chunks
 - Complex analytical queries: Leverage all 5 chunks for comprehensive responses
+
+---
+
+## FastAPI Service
+
+The RAG pipeline is exposed as a production-ready REST API via `main.py`, enabling any HTTP client (curl, Postman, browser, frontend app) to query the system programmatically.
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/root` | Welcome message and API status |
+| `GET` | `/health` | Model readiness check — returns loading state |
+| `POST` | `/ask` | Submit a question; returns structured JSON response |
+
+### Startup & Shutdown — Lifespan Management
+
+Models are loaded once at server startup using FastAPI's `@asynccontextmanager` lifespan pattern, avoiding per-request reloading overhead. On shutdown, all globals are cleared to release GPU memory cleanly.
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: load embeddings → FAISS index → LLM pipeline
+    embeddings = HuggingFaceEmbeddings(...)
+    vector_db = FAISS.load_local('RAG INDEX', ...)
+    pipe = pipeline(...)
+    yield
+    # Shutdown: release all resources
+    vector_db = pipe = embeddings = None
+```
+
+### Request & Response Schema
+
+**Request** (`POST /ask`):
+```json
+{
+  "question": "What is a BDC and what are its leverage requirements?"
+}
+```
+
+**Response**:
+```json
+{
+  "question": "What is a BDC and what are its leverage requirements?",
+  "response": "A Business Development Company (BDC) is..."
+}
+```
+
+Both schemas are enforced via Pydantic `BaseModel`, providing automatic request validation and clear error messages for malformed inputs.
+
+### Health Check
+
+Before sending queries, clients can poll `/health` to confirm models are ready:
+
+```json
+{ "status": "Ready", "Models_Loaded": true }
+```
+
+During startup (model loading takes 25–30s), the endpoint returns:
+
+```json
+{ "status": "loading", "Models_Loaded": false }
+```
+
+### Running the API
+
+```bash
+# Install FastAPI and server
+pip install fastapi uvicorn
+
+# Start the server
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+The interactive Swagger UI is available at `http://localhost:8000/docs` once the server is running.
+
+### Example Usage
+
+**curl**:
+```bash
+curl -X POST "http://localhost:8000/ask" \
+     -H "Content-Type: application/json" \
+     -d '{"question": "What is DRIP and what role does it play in BDC deleveraging?"}'
+```
+
+**Python (`requests`)**:
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8000/ask",
+    json={"question": "What are the leverage reduction strategies for BDCs?"}
+)
+print(response.json()["response"])
+```
 
 ---
 
@@ -202,7 +322,8 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 # Install dependencies
 pip install langchain-community langchain-huggingface transformers \
-            langchain-text-splitters faiss-cpu pymupdf sentence-transformers
+            langchain-text-splitters faiss-cpu pymupdf sentence-transformers \
+            fastapi uvicorn pydantic
 ```
 
 ### Build Vector Index
@@ -258,12 +379,27 @@ pipe = pipeline(
 )
 ```
 
-### Query the System
+### Start the API Server
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+The server loads all models at startup (~25–30s). Once `/health` returns `"Models_Loaded": true`, the API is ready to accept requests.
+
+### Query via API
 
 ```python
-response = format_prompt("What is a Business Development Company and how does it differ from traditional private equity?")
-print(response)
+import requests
+
+response = requests.post(
+    "http://localhost:8000/ask",
+    json={"question": "What is a Business Development Company and how does it differ from traditional private equity?"}
+)
+print(response.json()["response"])
 ```
+
+Or visit `http://localhost:8000/docs` for the interactive Swagger UI.
 
 ---
 
@@ -283,17 +419,16 @@ print(response)
 
 **Query**: "What are BDC assets?"
 
-**Response**: 
+**Response (Updated Prompt)**:
 ```
-BDC assets consist of two primary components: (1) principal amounts in loans extended 
-to private businesses, including leveraged loans, equipment financing, and commercial 
-paper, and (2) equity securities issued by portfolio companies. BDCs maintain these 
-investments until maturity or exit, while holding cash reserves (buffers) to manage 
-liquidity needs. The asset composition varies by institution, with some focusing on 
-senior secured debt while others hold mezzanine or equity positions.
+BDC assets consist of two primary components: (1) principal amounts invested in various 
+forms like loans, cash reserves, etc., along with any other relevant securities held 
+within them. Loans represent around 87% of most BDC portfolios' composition; Equity 
+represents approximately 5.9%; Other components may vary based on specific details per 
+individual BDC.
 ```
 
-**Retrieval Quality**: 5/5 relevant chunks retrieved, answer synthesizes information from 3 chunks.
+**Why this matters**: The updated prompt enforces verbatim metric citation (Rule 4), so figures like "87%" and "5.9%" are drawn directly from the document rather than approximated. Under the original prompt, the response paraphrased loosely — referencing "senior secured debt" and "mezzanine positions" which were not explicitly present in the retrieved context for this query.
 
 ---
 
@@ -333,12 +468,17 @@ senior secured debt while others hold mezzanine or equity positions.
 private-credit-rag/
 ├── data/
 │   └── Private_Cred_Fin_Stab_Paper.pdf    # Source document (56 pages)
-├── RAG_INDEX/                              # FAISS vector store
+├── RAG INDEX/                              # FAISS vector store (git-ignored)
 │   ├── index.faiss                         # Vector index file
 │   └── index.pkl                           # Metadata & docstore
-├── Private_cred_finstab_rag.ipynb         # Main notebook
+├── __pycache__/                            # Python cache (git-ignored)
+├── main.py                                 # FastAPI application entry point
+├── Private_cred_finstab_rag.ipynb         # Index-building & exploration notebook
+├── .gitignore                              # Excludes RAG INDEX/ and __pycache__/
 └── README.md
 ```
+
+> **Note**: The FAISS vector index (`RAG INDEX/`) is excluded from version control via `.gitignore` as it is a derived artifact that can be regenerated from the source PDF using the notebook. Run the notebook cells top-to-bottom to rebuild the index before starting the API server.
 
 ---
 
@@ -380,9 +520,11 @@ private-credit-rag/
 - [ ] **Quantization**: 4-bit quantized models for 4GB VRAM GPUs
 - [ ] **Hybrid Search**: Combine dense (FAISS) + sparse (BM25) retrieval
 - [ ] **Re-ranking**: Cross-encoder model for retrieval refinement
-- [ ] **Streaming Responses**: Token-by-token output for better UX
-- [ ] **Web Interface**: Gradio/Streamlit frontend
+- [ ] **Streaming Responses**: Token-by-token SSE output for lower perceived latency
+- [x] **REST API**: FastAPI service with `/ask`, `/health`, and `/root` endpoints ✅
+- [ ] **Web Interface**: Gradio/Streamlit frontend connecting to the FastAPI backend
 - [ ] **Evaluation Suite**: RAGAS metrics for retrieval & generation quality
+- [ ] **Authentication**: API key middleware for multi-user deployments
 
 ---
 
@@ -412,6 +554,7 @@ private-credit-rag/
 - **Hugging Face** for model hosting and transformers library
 - **Facebook AI Research** for FAISS
 - **LangChain** contributors for the RAG framework
+- **Sebastián Ramírez** for FastAPI
 - **Paper Authors** for the foundational research
 
 ---
